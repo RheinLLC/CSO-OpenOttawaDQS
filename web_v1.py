@@ -236,8 +236,8 @@ def score_dimensions(df: pd.DataFrame):
 # -------------------------
 # Streamlit UI (Assessment-only; controls removed)
 # -------------------------
-st.set_page_config(page_title="Open Data DQS (Assessment)", layout="wide")
-st.title("Open Data DQS (Assessment Only)")
+st.set_page_config(page_title="Open Data DQS", layout="wide")
+st.title("Open Data DQS")
 
 uploaded = st.file_uploader("Upload a CSV", type=["csv"])
 
@@ -250,11 +250,11 @@ df_raw = pd.read_csv(uploaded)
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("Preview (Raw)")
+    st.subheader("Preview")
     st.dataframe(df_raw.head(20), use_container_width=True)
 
 with col2:
-    st.subheader("Quality Score (After Deterministic Cleaning)")
+    st.subheader("Quality Score)")
     df_clean_base, clean_notes = clean_df(df_raw.copy())
     scores_raw, total_raw, issues_raw = score_dimensions(df_clean_base)
 
