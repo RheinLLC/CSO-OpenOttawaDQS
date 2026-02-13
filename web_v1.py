@@ -277,10 +277,10 @@ with col2:
     st.subheader("DQS Issue Log")
 
     if issues_raw:
-        # 当前 issues_raw 结构是 [(metric, detail), ...]
+        # issues_raw: [(metric, detail), ...]
         issues_df = pd.DataFrame(issues_raw, columns=["metric", "detail"])
 
-        # 给每条 issue 一个默认 severity（按 metric 规则粗分，后续你也可以细化）
+        # severity
         def _severity(metric: str) -> str:
             metric = (metric or "").lower()
             if metric in {"freshness", "completeness"}:
@@ -293,14 +293,13 @@ with col2:
 
         issues_df["severity"] = issues_df["metric"].map(_severity)
 
-        # 展示表格
         st.dataframe(
             issues_df[["metric", "severity", "detail"]],
             use_container_width=True,
             hide_index=True,
         )
 
-        # 下载 Issue Log（CSV）
+        # download Issue Log（CSV）
         st.download_button(
             "Download DQS Issue Log (CSV)",
             issues_df.to_csv(index=False).encode("utf-8"),
