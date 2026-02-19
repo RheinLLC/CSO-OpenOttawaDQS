@@ -105,6 +105,74 @@ def grade_from_likert(likert: int) -> str:
 
 
 # -------------------------
+# Usage Guidance Engine
+# -------------------------
+def _bucket(score: float) -> str:
+    if score >= 80:
+        return "good"
+    if score >= 60:
+        return "ok"
+    return "low"
+
+
+DIMENSION_ADVICE = {
+    "completeness": {
+        "do": [
+            "Use for high-level aggregation and trend analysis",
+            "Use for exploratory analysis (EDA)",
+        ],
+        "avoid": [
+            "Avoid record-level or individual decision-making",
+            "Avoid claiming exact totals without coverage checks",
+        ],
+    },
+    "freshness": {
+        "do": ["Use for historical context and long-term trends"],
+        "avoid": ["Avoid real-time or current-state decision making"],
+    },
+    "metadata": {
+        "do": ["Use internally by experienced analysts"],
+        "avoid": ["Avoid public-facing dashboards without added documentation"],
+    },
+    "usability": {
+        "do": ["Use after preprocessing and cleaning"],
+        "avoid": ["Avoid rapid analysis without validation"],
+    },
+    "accessibility": {
+        "do": ["Use in programmatic workflows (Python/R)"],
+        "avoid": ["Avoid expecting easy spreadsheet-based use"],
+    },
+}
+
+
+def generate_usage_guidance(total_score_0_100: float, scores: dict) -> dict:
+    do, avoid = [], []
+
+    if total_score_0_100 >= 80:
+        do.append("Suitable for dashboards and general analysis")
+    elif total_score_0_100 >= 60:
+        do.append("Suitable for analysis with clear limitations")
+        avoid.append("Avoid precise lookups or operational decisions")
+    else:
+        do.append("Suitable for prototypes, education, and context only")
+        avoid.append("Avoid decision-making or public reporting")
+
+    for dim in ["completeness", "freshness", "metadata", "usability", "accessibility"]:
+        s = float(scores.get(dim, 0.0))
+        if _bucket(s) == "low":
+            do.extend(DIMENSION_ADVICE[dim]["do"])
+            avoid.extend(DIMENSION_ADVICE[dim]["avoid"])
+
+    do = list(dict.fromkeys(do))
+    avoid = list(dict.fromkeys(avoid))
+
+    return {
+        "Recommended_Use": " | ".join(do),
+        "Not_Recommended_For": " | ".join(avoid),
+    }
+
+
+# -------------------------
 # Cleaning (reproducible, deterministic)
 # -------------------------
 def clean_df(df: pd.DataFrame):
@@ -114,13 +182,11 @@ def clean_df(df: pd.DataFrame):
     if changes:
         issues.append(("usability", "Standardized column names (trim/collapse spaces)."))
 
-    # Convert comma-number text to numeric
     for c in df.columns:
         if is_comma_number_text(df[c]):
             df[c] = to_numeric_clean(df[c])
             issues.append(("usability", f"Converted comma-number text to numeric in '{c}'."))
 
-    # Parse date-like columns
     for c in df.columns:
         if is_date_like(df[c]):
             dt = parse_datetime_safe(df[c])
@@ -130,7 +196,6 @@ def clean_df(df: pd.DataFrame):
                 df[c] = dt
                 issues.append(("usability", f"Parsed datetime in '{c}'."))
 
-    # Add Year if possible
     if "Year" not in df.columns:
         dt_cols = [c for c in df.columns if is_datetime64_any_dtype(df[c])]
         if dt_cols:
@@ -146,7 +211,6 @@ def clean_df(df: pd.DataFrame):
 def score_dimensions(df: pd.DataFrame):
     issues = []
 
-    # Completeness (missingness + severe columns)
     miss_by_col = df.isna().mean().fillna(0.0)
     avg_missing = float(miss_by_col.mean()) if len(miss_by_col) else 0.0
     severe_cols = miss_by_col[miss_by_col >= SEVERE_MISSING_COL]
@@ -156,7 +220,6 @@ def score_dimensions(df: pd.DataFrame):
     if len(severe_cols) > 0:
         issues.append(("completeness", f"{len(severe_cols)} columns have >=50% missing."))
 
-    # Freshness
     current_year = datetime.now().year
     freshness = 60.0
     if "Year" in df.columns:
@@ -180,7 +243,6 @@ def score_dimensions(df: pd.DataFrame):
                 freshness = max(0.0, 100.0 - 15.0 * (age - STALE_YEARS))
                 issues.append(("freshness", f"Latest date {latest.date()} in '{dt_cols[0]}' is old."))
 
-    # Usability (names + constant columns)
     usability = 100.0
     mratio = meaningful_name_ratio(df.columns)
     if mratio < 0.20:
@@ -201,14 +263,12 @@ def score_dimensions(df: pd.DataFrame):
 
     usability = float(np.clip(usability, 0, 100))
 
-    # Accessibility (local: readable + not huge/wide)
     accessibility = 100.0
     if df.shape[1] > 80:
         accessibility -= 15
         issues.append(("accessibility", f"Very wide table ({df.shape[1]} columns)."))
     accessibility = float(np.clip(accessibility, 0, 100))
 
-    # Metadata (local proxy)
     metadata = 100.0
     meta_like = [
         c
@@ -219,7 +279,7 @@ def score_dimensions(df: pd.DataFrame):
         metadata -= 50
         issues.append(("metadata", "No descriptive/definition/unit columns detected (local proxy)."))
     else:
-        metadata -= 30  # still penalize because portal metadata not available locally
+        metadata -= 30
     metadata = float(np.clip(metadata, 0, 100))
 
     scores = {
@@ -254,7 +314,7 @@ with col1:
     st.dataframe(df_raw.head(20), use_container_width=True)
 
 with col2:
-    st.subheader("Quality Score)")
+    st.subheader("Quality Score")
     df_clean_base, clean_notes = clean_df(df_raw.copy())
     scores_raw, total_raw, issues_raw = score_dimensions(df_clean_base)
 
@@ -267,7 +327,15 @@ with col2:
     likert = likert_from_score(total_raw)
     st.write({"Likert Score (1–5)": likert, "Grade (A/B/C)": grade_from_likert(likert)})
 
-    st.json({f"{k}_score": round(v, 2) for k, v in scores_raw.items()})
+    st.json({f'{k}_score': round(v, 2) for k, v in scores_raw.items()})
+
+    guidance = generate_usage_guidance(total_raw, scores_raw)
+    st.divider()
+    st.subheader("Usage Guidance")
+    st.markdown("**Recommended_Use**")
+    st.write(guidance["Recommended_Use"] or "—")
+    st.markdown("**Not_Recommended_For**")
+    st.write(guidance["Not_Recommended_For"] or "—")
 
     if clean_notes:
         st.caption("Deterministic cleaning applied before scoring:")
@@ -277,10 +345,8 @@ with col2:
     st.subheader("DQS Issue Log")
 
     if issues_raw:
-        # issues_raw: [(metric, detail), ...]
         issues_df = pd.DataFrame(issues_raw, columns=["metric", "detail"])
 
-        # severity
         def _severity(metric: str) -> str:
             metric = (metric or "").lower()
             if metric in {"freshness", "completeness"}:
@@ -298,14 +364,5 @@ with col2:
             use_container_width=True,
             hide_index=True,
         )
-
-        # download Issue Log（CSV）
-        st.download_button(
-            "Download DQS Issue Log (CSV)",
-            issues_df.to_csv(index=False).encode("utf-8"),
-            file_name="dqs_issue_log.csv",
-            mime="text/csv",
-        )
     else:
         st.info("No issues detected by current rule-based checks for this dataset.")
-
