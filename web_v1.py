@@ -182,11 +182,13 @@ def clean_df(df: pd.DataFrame):
     if changes:
         issues.append(("usability", "Standardized column names (trim/collapse spaces)."))
 
+    # Convert comma-number text to numeric
     for c in df.columns:
         if is_comma_number_text(df[c]):
             df[c] = to_numeric_clean(df[c])
             issues.append(("usability", f"Converted comma-number text to numeric in '{c}'."))
 
+    # Parse date-like columns
     for c in df.columns:
         if is_date_like(df[c]):
             dt = parse_datetime_safe(df[c])
@@ -196,6 +198,7 @@ def clean_df(df: pd.DataFrame):
                 df[c] = dt
                 issues.append(("usability", f"Parsed datetime in '{c}'."))
 
+    # Add Year if possible
     if "Year" not in df.columns:
         dt_cols = [c for c in df.columns if is_datetime64_any_dtype(df[c])]
         if dt_cols:
@@ -211,6 +214,7 @@ def clean_df(df: pd.DataFrame):
 def score_dimensions(df: pd.DataFrame):
     issues = []
 
+    # Completeness (missingness + severe columns)
     miss_by_col = df.isna().mean().fillna(0.0)
     avg_missing = float(miss_by_col.mean()) if len(miss_by_col) else 0.0
     severe_cols = miss_by_col[miss_by_col >= SEVERE_MISSING_COL]
@@ -220,6 +224,7 @@ def score_dimensions(df: pd.DataFrame):
     if len(severe_cols) > 0:
         issues.append(("completeness", f"{len(severe_cols)} columns have >=50% missing."))
 
+    # Freshness
     current_year = datetime.now().year
     freshness = 60.0
     if "Year" in df.columns:
@@ -243,6 +248,7 @@ def score_dimensions(df: pd.DataFrame):
                 freshness = max(0.0, 100.0 - 15.0 * (age - STALE_YEARS))
                 issues.append(("freshness", f"Latest date {latest.date()} in '{dt_cols[0]}' is old."))
 
+    # Usability (names + constant columns)
     usability = 100.0
     mratio = meaningful_name_ratio(df.columns)
     if mratio < 0.20:
@@ -263,12 +269,14 @@ def score_dimensions(df: pd.DataFrame):
 
     usability = float(np.clip(usability, 0, 100))
 
+    # Accessibility (local: readable + not huge/wide)
     accessibility = 100.0
     if df.shape[1] > 80:
         accessibility -= 15
         issues.append(("accessibility", f"Very wide table ({df.shape[1]} columns)."))
     accessibility = float(np.clip(accessibility, 0, 100))
 
+    # Metadata (local proxy)
     metadata = 100.0
     meta_like = [
         c
@@ -279,7 +287,7 @@ def score_dimensions(df: pd.DataFrame):
         metadata -= 50
         issues.append(("metadata", "No descriptive/definition/unit columns detected (local proxy)."))
     else:
-        metadata -= 30
+        metadata -= 30  # still penalize because portal metadata not available locally
     metadata = float(np.clip(metadata, 0, 100))
 
     scores = {
@@ -309,15 +317,25 @@ df_raw = pd.read_csv(uploaded)
 
 col1, col2 = st.columns([1, 1])
 
+# Compute once (so Usage Guidance can be shown in left column)
+df_clean_base, clean_notes = clean_df(df_raw.copy())
+scores_raw, total_raw, issues_raw = score_dimensions(df_clean_base)
+guidance = generate_usage_guidance(total_raw, scores_raw)
+
 with col1:
     st.subheader("Preview")
     st.dataframe(df_raw.head(20), use_container_width=True)
 
+    # --- move Usage Guidance to left-bottom (under Preview) ---
+    st.divider()
+    st.subheader("Usage Guidance")
+    st.markdown("**Recommended_Use**")
+    st.write(guidance["Recommended_Use"] or "—")
+    st.markdown("**Not_Recommended_For**")
+    st.write(guidance["Not_Recommended_For"] or "—")
+
 with col2:
     st.subheader("Quality Score")
-    df_clean_base, clean_notes = clean_df(df_raw.copy())
-    scores_raw, total_raw, issues_raw = score_dimensions(df_clean_base)
-
     st.metric(
         "Total Score (0–100)",
         f"{total_raw:.2f}",
@@ -327,15 +345,7 @@ with col2:
     likert = likert_from_score(total_raw)
     st.write({"Likert Score (1–5)": likert, "Grade (A/B/C)": grade_from_likert(likert)})
 
-    st.json({f'{k}_score': round(v, 2) for k, v in scores_raw.items()})
-
-    guidance = generate_usage_guidance(total_raw, scores_raw)
-    st.divider()
-    st.subheader("Usage Guidance")
-    st.markdown("**Recommended_Use**")
-    st.write(guidance["Recommended_Use"] or "—")
-    st.markdown("**Not_Recommended_For**")
-    st.write(guidance["Not_Recommended_For"] or "—")
+    st.json({f"{k}_score": round(v, 2) for k, v in scores_raw.items()})
 
     if clean_notes:
         st.caption("Deterministic cleaning applied before scoring:")
