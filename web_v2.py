@@ -12,10 +12,6 @@ import pandas as pd
 import streamlit as st
 from pandas.api.types import is_datetime64_any_dtype
 
-from metadata import fetch_metadata_xml_from_dataset_url
-from xml_to_jsonl import convert_xml_dir_to_jsonl
-from jsonl_cleaning import clean_jsonl
-
 WEIGHTS = {
     "freshness": 0.35,
     "metadata": 0.35,
@@ -28,6 +24,11 @@ PARSE_OK_RATE = 0.60
 STALE_YEARS = 2
 STOP_WORDS = {"id", "uid", "key", "value", "val", "x", "y", "col", "column", "unnamed"}
 IMPORTANT_COL_HINTS = ["date", "year", "count", "total", "value", "rate", "amount", "type", "category", "class"]
+SIDECAR_EXTS = [".md", ".txt", ".json", ".yml", ".yaml", ".pdf", ".docx"]
+
+# 与 v5 对齐
+METADATA_JSONL_PATH = "dataIdInfo_only_clean.jsonl"
+METADATA_CATALOG_JSON_PATH = "ottawa_catalog.json"
 
 try:
     _ON_BAD_LINES_SUPPORTED = "on_bad_lines" in pd.read_csv.__code__.co_varnames  # type: ignore[attr-defined]
@@ -52,6 +53,7 @@ def likert_from_score(score_0_100: float) -> int:
 
 
 def grade_from_score(score_0_100: float) -> str:
+    # 保留 web_v2 原本 A/B/C 映射
     if score_0_100 >= 80:
         return "A"
     if score_0_100 >= 60:
@@ -186,6 +188,347 @@ def read_csv_flex(path: str) -> pd.DataFrame:
         raise last_err or exc
 
 
+# =========================
+# Sidecar metadata helpers
+# =========================
+def find_sidecar_metadata_files(csv_path: str) -> List[str]:
+    base = os.path.splitext(csv_path)[0]
+    found = []
+    for ext in SIDECAR_EXTS:
+        cand = base + ext
+        if os.path.exists(cand):
+            found.append(cand)
+    return found
+
+
+def _read_text_sidecar(path: str, max_chars: int = 8000) -> Optional[str]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".md", ".txt", ".yml", ".yaml", ".json"]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read(max_chars)
+        except Exception:
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                    return f.read(max_chars)
+            except Exception:
+                return None
+    return None
+
+
+def infer_metadata_from_sidecars(sidecars: List[str]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    texts = []
+    for p in sidecars:
+        t = _read_text_sidecar(p)
+        if t:
+            texts.append(t)
+    if not texts:
+        return meta
+
+    combined = "\n".join(texts)
+    meta["description_text"] = combined
+
+    freq_map = {
+        "daily": r"\bdaily\b",
+        "weekly": r"\bweekly\b",
+        "monthly": r"\bmonthly\b",
+        "annual": r"\bannual(?:ly)?\b|\byearly\b",
+        "one-off": r"\bone[-\s]?off\b|\bas needed\b|\bsporadic\b",
+    }
+    for k, patt in freq_map.items():
+        if re.search(patt, combined, flags=re.I):
+            meta["update_frequency"] = k
+            break
+
+    m = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", combined)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            meta["last_updated"] = datetime(y, mo, d)
+        except Exception:
+            pass
+
+    return meta
+
+
+# =========================
+# Portal/Catalog metadata helpers
+# =========================
+def _norm_name(s: str) -> str:
+    s = (s or "").lower()
+    s = os.path.splitext(s)[0]
+    s = re.sub(r"__.*$", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _token_set(s: str) -> set:
+    return {t for t in _norm_name(s).split(" ") if t and t not in STOP_WORDS}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _parse_update_frequency(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.lower()
+    if re.search(r"update\s*frequency\s*:\s*as\s*needed|as-needed", t):
+        return "one-off"
+    if re.search(r"update\s*frequency\s*:\s*not\s*applicable|one[-\s]?time", t):
+        return "one-off"
+    if re.search(r"update\s*frequency\s*:\s*daily", t):
+        return "daily"
+    if re.search(r"update\s*frequency\s*:\s*weekly", t):
+        return "weekly"
+    if re.search(r"update\s*frequency\s*:\s*monthly", t):
+        return "monthly"
+    if re.search(r"update\s*frequency\s*:\s*annual|yearly", t):
+        return "annual"
+    return None
+
+
+def _parse_first_date(text: str) -> Optional[datetime]:
+    if not text:
+        return None
+
+    m = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return datetime(y, mo, d)
+        except Exception:
+            pass
+
+    m2 = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(20\d{2})\b",
+        text,
+        flags=re.I,
+    )
+    if m2:
+        mon_s, d_s, y_s = m2.groups()
+        mon_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        mo = mon_map[mon_s[:3].lower()]
+        y = int(y_s)
+        d = int(d_s)
+        try:
+            return datetime(y, mo, d)
+        except Exception:
+            pass
+    return None
+
+
+def load_portal_metadata_jsonl(path: str) -> Dict[str, Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            di = rec.get("dataIdInfo", {}) if isinstance(rec, dict) else {}
+            title = (((di.get("idCitation") or {}).get("resTitle") or {}).get("#text")) if isinstance(di, dict) else None
+            if not title:
+                continue
+
+            id_abs = (di.get("idAbs") or {}).get("#text") if isinstance(di.get("idAbs"), dict) else ""
+            id_purp = (di.get("idPurp") or {}).get("#text") if isinstance(di.get("idPurp"), dict) else ""
+            keywords = []
+            sk = di.get("searchKeys")
+            if isinstance(sk, dict) and isinstance(sk.get("keyword"), list):
+                for kw in sk["keyword"]:
+                    if isinstance(kw, dict) and kw.get("#text"):
+                        keywords.append(str(kw["#text"]))
+
+            create_dt = None
+            revise_dt = None
+            for k in ["createDate", "reviseDate"]:
+                v = di.get(k)
+                if isinstance(v, dict) and v.get("#text"):
+                    try:
+                        s = str(v["#text"]).replace("Z", "")
+                        if k == "createDate":
+                            create_dt = datetime.fromisoformat(s)
+                        else:
+                            revise_dt = datetime.fromisoformat(s)
+                    except Exception:
+                        pass
+
+            free_text = "\n".join([str(id_abs or ""), str(id_purp or "")])
+            if create_dt is None:
+                create_dt = _parse_first_date(free_text)
+            last_updated = revise_dt or create_dt
+            freq = _parse_update_frequency(free_text)
+            desc_text = " ".join([str(id_abs or ""), str(id_purp or ""), " ".join(keywords)]).strip()
+
+            out[_norm_name(title)] = {
+                "title": title,
+                "description_text": desc_text if desc_text else None,
+                "update_frequency": freq,
+                "last_updated": last_updated,
+                "source": "portal",
+            }
+    return out
+
+
+def match_portal_metadata(csv_filename: str, portal_map: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not portal_map:
+        return None
+    base = _norm_name(csv_filename)
+    if base in portal_map:
+        return portal_map[base]
+
+    base_tokens = _token_set(csv_filename)
+    best = None
+    best_sim = 0.0
+    for k, meta in portal_map.items():
+        sim = _jaccard(base_tokens, _token_set(k))
+        if sim > best_sim:
+            best_sim = sim
+            best = meta
+    if best and best_sim >= 0.55:
+        return best
+    return None
+
+
+def _strip_html(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    s = re.sub(r"<br\s*/?>", " ", str(text), flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"&nbsp;", " ", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or None
+
+
+def _parse_iso_datetime(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _distribution_access_urls(distributions: Any) -> List[str]:
+    urls: List[str] = []
+    if not isinstance(distributions, list):
+        return urls
+    for dist in distributions:
+        if not isinstance(dist, dict):
+            continue
+        for k in ["accessURL", "downloadURL"]:
+            u = dist.get(k)
+            if u:
+                urls.append(str(u))
+    return urls
+
+
+def _distribution_csv_url(distributions: Any) -> Optional[str]:
+    if not isinstance(distributions, list):
+        return None
+    for dist in distributions:
+        if not isinstance(dist, dict):
+            continue
+        fmt = str(dist.get("format") or "").strip().lower()
+        media = str(dist.get("mediaType") or "").strip().lower()
+        title = str(dist.get("title") or "").strip().lower()
+        if fmt == "csv" or media == "text/csv" or title == "csv":
+            return str(dist.get("accessURL") or dist.get("downloadURL") or "") or None
+    return None
+
+
+def load_catalog_metadata_json(path: str) -> Dict[str, Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+
+    datasets = obj.get("dataset", []) if isinstance(obj, dict) else []
+    if not isinstance(datasets, list):
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for rec in datasets:
+        if not isinstance(rec, dict):
+            continue
+
+        title = rec.get("title")
+        if not title:
+            continue
+
+        description = _strip_html(rec.get("description"))
+        keywords = rec.get("keyword") if isinstance(rec.get("keyword"), list) else []
+        keyword_text = " ".join([str(k).strip() for k in keywords if str(k).strip()])
+
+        issued_dt = _parse_iso_datetime(rec.get("issued"))
+        modified_dt = _parse_iso_datetime(rec.get("modified"))
+        last_updated = modified_dt or issued_dt
+
+        free_text = " ".join([str(description or ""), keyword_text, str(rec.get("landingPage") or "")]).strip()
+        freq = _parse_update_frequency(free_text)
+
+        out[_norm_name(str(title))] = {
+            "title": str(title),
+            "description_text": " ".join([x for x in [description, keyword_text] if x]).strip() or None,
+            "description": description,
+            "update_frequency": freq,
+            "last_updated": last_updated,
+            "issued": issued_dt,
+            "modified": modified_dt,
+            "landing_page": rec.get("landingPage"),
+            "csv_url": _distribution_csv_url(rec.get("distribution")),
+            "distribution_urls": _distribution_access_urls(rec.get("distribution")),
+            "source": "catalog",
+        }
+    return out
+
+
+def merge_metadata_sources(*meta_dicts: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    source_chain: List[str] = []
+    for meta in meta_dicts:
+        if not meta:
+            continue
+        src = meta.get("source")
+        if src:
+            source_chain.append(str(src))
+        for k, v in meta.items():
+            if v is not None:
+                out[k] = v
+    if source_chain:
+        out["source_chain"] = " > ".join(source_chain)
+    return out
+
+
+# =========================
+# Cleaning
+# =========================
 def clean_df(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
     df, changes = standardize_columns(df)
     if changes:
@@ -231,6 +574,9 @@ def clean_df(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tuple[pd.Da
     return df, issues_list
 
 
+# =========================
+# Scoring
+# =========================
 def score_completeness(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tuple[float, List[Dict[str, str]]]:
     score = 100.0
     weighted_missing = []
@@ -252,10 +598,10 @@ def score_completeness(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> T
         score -= 60.0 * float(np.mean(weighted_missing))
 
     if "Year" in df.columns:
-        years = pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int)
-        if len(years) >= 2:
-            expected = set(range(int(years.min()), int(years.max()) + 1))
-            missing_years = sorted(expected - set(years))
+        yrs = pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int)
+        if len(yrs) >= 2:
+            expected = set(range(int(yrs.min()), int(yrs.max()) + 1))
+            missing_years = sorted(expected - set(yrs))
             if missing_years:
                 score -= 25.0
                 issues_list.append(issue("completeness", f"Missing entire year(s): {missing_years}.", "high"))
@@ -263,38 +609,30 @@ def score_completeness(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> T
     return float(np.clip(score, 0, 100)), issues_list
 
 
-def score_freshness(
-    df: pd.DataFrame,
-    issues_list: List[Dict[str, str]],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, List[Dict[str, str]]]:
+# 与 v5 完全对齐
+def score_freshness(df: pd.DataFrame, issues_list: List[Dict[str, str]], metadata: Optional[Dict[str, Any]] = None) -> Tuple[float, List[Dict[str, str]]]:
     now = datetime.now()
+
     if metadata:
         freq = metadata.get("update_frequency")
-        last_updated = metadata.get("last_updated")
+        last = metadata.get("last_updated")
+
         if freq == "one-off":
             return 100.0, issues_list
-        if isinstance(last_updated, datetime):
-            age_days = (now - last_updated).days
-            allowed_lag = {
-                "daily": 2,
-                "weekly": 10,
-                "monthly": 45,
-                "annual": 400,
-            }.get(str(freq).lower() if freq else "annual", 400)
+
+        if isinstance(last, datetime):
+            age_days = (now - last).days
+            allowed_lag = {"daily": 2, "weekly": 10, "monthly": 45, "annual": 400}.get(str(freq).lower() if freq else "annual", 400)
+
             if age_days <= allowed_lag:
                 return 100.0, issues_list
+
             score = max(0.0, 100.0 - (age_days - allowed_lag) * 0.15)
-            issues_list.append(
-                issue(
-                    "freshness",
-                    f"Dataset is {age_days} days old (expected {freq or 'annual'} refresh).",
-                    "high",
-                )
-            )
+            issues_list.append(issue("freshness", f"Dataset is {age_days} days old (expected {freq or 'annual'} refresh).", "high"))
             return float(np.clip(score, 0, 100)), issues_list
 
     current_year = now.year
+
     if "Year" in df.columns:
         years = pd.to_numeric(df["Year"], errors="coerce").dropna()
         if not years.empty:
@@ -308,15 +646,15 @@ def score_freshness(
 
     dt_cols = [c for c in df.columns if is_datetime64_any_dtype(df[c])]
     if dt_cols:
-        col = dt_cols[0]
-        dt = df[col].dropna()
+        c = dt_cols[0]
+        dt = df[c].dropna()
         if not dt.empty:
             latest = pd.to_datetime(dt).max()
             age_years = current_year - int(latest.year)
             if age_years <= STALE_YEARS:
                 return 100.0, issues_list
             score = max(0.0, 100.0 - 15.0 * (age_years - STALE_YEARS))
-            issues_list.append(issue("freshness", f"Latest date in '{col}' is {latest.date()} (age≈{age_years} years).", "medium"))
+            issues_list.append(issue("freshness", f"Latest date in '{c}' is {latest.date()} (age≈{age_years} years).", "medium"))
             return float(np.clip(score, 0, 100)), issues_list
 
     issues_list.append(issue("freshness", "No schedule metadata and no usable Year/date found; freshness uncertain.", "medium"))
@@ -325,81 +663,62 @@ def score_freshness(
 
 def meaningful_name_ratio(columns) -> float:
     good = 0
-    for col in columns:
-        c0 = str(col).strip().lower()
+    for c in columns:
+        c0 = str(c).strip().lower()
         if c0.startswith("unnamed"):
             continue
         tokens = re.split(r"[^a-z0-9]+", c0)
-        tokens = [token for token in tokens if token and token not in STOP_WORDS]
-        if any(len(token) >= 3 for token in tokens):
+        tokens = [t for t in tokens if t and t not in STOP_WORDS]
+        if any(len(t) >= 3 for t in tokens):
             good += 1
     return good / max(1, len(columns))
 
 
 def score_usability(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tuple[float, List[Dict[str, str]]]:
     score = 100.0
-    mratio = meaningful_name_ratio(df.columns)
-    if mratio < 0.20:
-        issues_list.append(issue("usability", f"Low meaningful column name ratio: {mratio:.0%}.", "high"))
-        score -= 50
-    elif mratio < 0.50:
-        issues_list.append(issue("usability", f"Moderate column name meaningfulness: {mratio:.0%}.", "medium"))
-        score -= 20
+
+    mnr = meaningful_name_ratio(df.columns)
+    if mnr < 0.8:
+        issues_list.append(issue("usability", f"Some column names are not descriptive enough (meaningful ratio={mnr:.2f}).", "medium"))
+        score -= 15
 
     const_cols = []
-    for col in df.columns:
-        nn = df[col].dropna()
-        if len(nn) == 0:
-            if not is_vestigial(col):
-                const_cols.append(col)
-        elif nn.nunique() == 1 and not is_vestigial(col):
-            const_cols.append(col)
+    for c in df.columns:
+        if is_vestigial(c):
+            continue
+        if df[c].nunique(dropna=True) <= 1 and df[c].notna().sum() > 0:
+            const_cols.append(c)
     if const_cols:
-        issues_list.append(issue("usability", f"{len(const_cols)} constant/empty columns may reduce usability.", "medium"))
-        score -= min(25, 3 * len(const_cols))
+        issues_list.append(issue("usability", f"Constant-value columns may add little analytic value: {const_cols[:6]}{'...' if len(const_cols) > 6 else ''}", "low"))
+        score -= min(10, 2 * len(const_cols))
 
-    num_text_cols = [col for col in df.columns if is_comma_number_text(df[col])]
+    num_text_cols = [c for c in df.columns if is_comma_number_text(df[c])]
     if num_text_cols:
-        issues_list.append(
-            issue(
-                "usability",
-                f"Numeric-like text columns require preprocessing: {num_text_cols[:6]}{'...' if len(num_text_cols) > 6 else ''}",
-                "medium",
-            )
-        )
+        issues_list.append(issue("usability", f"Numeric-like text columns require preprocessing: {num_text_cols[:6]}{'...' if len(num_text_cols) > 6 else ''}", "medium"))
         score -= 10
 
-    obj_cols = [col for col in df.columns if df[col].dtype == object]
+    obj_cols = [c for c in df.columns if df[c].dtype == object]
+
     risk_cols = []
-    for col in obj_cols[:50]:
-        s = df[col].dropna().astype(str).head(200)
+    for c in obj_cols[:50]:
+        s = df[c].dropna().astype(str).head(200)
         if s.empty:
             continue
-        if s.str.match(r"^\s*\d{1,2}[-/]\d{1,2}\s*$").any() or s.str.match(r"^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2}\s*$").any():
-            risk_cols.append(col)
+        if s.str.fullmatch(r"\d{1,2}[-/]\d{1,2}").any():
+            risk_cols.append(c)
     if risk_cols:
-        issues_list.append(
-            issue(
-                "usability",
-                f"Excel auto-date conversion risk in fields: {risk_cols[:6]}{'...' if len(risk_cols) > 6 else ''}",
-                "low",
-            )
-        )
+        issues_list.append(issue("usability", f"Excel auto-date conversion risk in fields: {risk_cols[:6]}{'...' if len(risk_cols) > 6 else ''}", "low"))
         score -= 5
 
     cr_cols = []
-    for col in obj_cols[:50]:
-        s = df[col].dropna().astype(str).head(200)
-        if not s.empty and s.str.contains(r"\r|\n").any():
-            cr_cols.append(col)
+    for c in obj_cols[:50]:
+        s = df[c].dropna().astype(str).head(200)
+        if s.empty:
+            continue
+        if s.str.contains(r"\r|\n").any():
+            cr_cols.append(c)
     if cr_cols:
-        issues_list.append(
-            issue(
-                "usability",
-                f"Carriage returns/newlines found in text fields: {cr_cols[:6]}{'...' if len(cr_cols) > 6 else ''}",
-                "low",
-            )
-        )
+        issues_list.append(issue("usability", f"Carriage returns/newlines found in text fields: {cr_cols[:6]}{'...' if len(cr_cols) > 6 else ''}", "low"))
         score -= 3
 
     return float(np.clip(score, 0, 100)), issues_list
@@ -408,6 +727,7 @@ def score_usability(df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tupl
 def score_accessibility(csv_path: str, df: pd.DataFrame, issues_list: List[Dict[str, str]]) -> Tuple[float, List[Dict[str, str]]]:
     del csv_path
     score = 100.0
+
     if df.shape[1] > 120:
         issues_list.append(issue("accessibility", f"Very high column count ({df.shape[1]}) may reduce accessibility in spreadsheets.", "medium"))
         score -= 15
@@ -415,157 +735,80 @@ def score_accessibility(csv_path: str, df: pd.DataFrame, issues_list: List[Dict[
         issues_list.append(issue("accessibility", f"High column count ({df.shape[1]}) may reduce accessibility in spreadsheets.", "low"))
         score -= 8
 
-    obj_cols = [col for col in df.columns if df[col].dtype == object]
+    obj_cols = [c for c in df.columns if df[c].dtype == object]
     if obj_cols:
         sample_lens = []
-        for col in obj_cols[:10]:
-            s = df[col].dropna().astype(str).head(200)
+        for c in obj_cols[:10]:
+            s = df[c].dropna().astype(str).head(200)
             if not s.empty:
                 sample_lens.append(float(s.map(len).mean()))
         if sample_lens and float(np.mean(sample_lens)) > 200:
             issues_list.append(issue("accessibility", "Long free-text fields may limit some users/tools (large cells).", "low"))
             score -= 5
+
     return float(np.clip(score, 0, 100)), issues_list
 
 
-def _read_clean_jsonl_record(clean_jsonl_path: str) -> Optional[Dict[str, Any]]:
-    with open(clean_jsonl_path, "r", encoding="utf-8") as fin:
-        for line in fin:
-            line = line.strip()
-            if line:
-                return json.loads(line)
-    return None
-
-
-def _parse_update_frequency(text: str) -> Optional[str]:
-    if not text:
-        return None
-    t = text.lower()
-    if re.search(r"update\s*frequency\s*:\s*as\s*needed|as-needed|one[-\s]?off|sporadic", t):
-        return "one-off"
-    if re.search(r"update\s*frequency\s*:\s*daily|\bdaily\b", t):
-        return "daily"
-    if re.search(r"update\s*frequency\s*:\s*weekly|\bweekly\b", t):
-        return "weekly"
-    if re.search(r"update\s*frequency\s*:\s*monthly|\bmonthly\b", t):
-        return "monthly"
-    if re.search(r"update\s*frequency\s*:\s*annual|yearly|annually", t):
-        return "annual"
-    return None
-
-
-def _parse_dt(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, dict):
-        value = value.get("#text")
-    if not isinstance(value, str):
-        return None
-    value = value.replace("Z", "")
-    for fmt in [None, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]:
-        try:
-            if fmt is None:
-                return datetime.fromisoformat(value)
-            return datetime.strptime(value, fmt)
-        except Exception:
-            continue
-    return None
-
-
-def portal_record_to_metadata(record: Dict[str, Any], dataset_url: str) -> Dict[str, Any]:
-    di = record.get("dataIdInfo", {}) if isinstance(record, dict) else {}
-    title = (((di.get("idCitation") or {}).get("resTitle") or {}).get("#text")) if isinstance(di, dict) else None
-    id_abs = (di.get("idAbs") or {}).get("#text") if isinstance(di.get("idAbs"), dict) else ""
-    id_purp = (di.get("idPurp") or {}).get("#text") if isinstance(di.get("idPurp"), dict) else ""
-
-    keywords: List[str] = []
-    search_keys = di.get("searchKeys")
-    if isinstance(search_keys, dict):
-        keyword_node = search_keys.get("keyword")
-        if isinstance(keyword_node, list):
-            for kw in keyword_node:
-                if isinstance(kw, dict) and kw.get("#text"):
-                    keywords.append(str(kw["#text"]))
-        elif isinstance(keyword_node, dict) and keyword_node.get("#text"):
-            keywords.append(str(keyword_node["#text"]))
-
-    date_obj = (((di.get("idCitation") or {}).get("date") or {})) if isinstance(di, dict) else {}
-    create_dt = _parse_dt(date_obj.get("createDate"))
-    revise_dt = _parse_dt(date_obj.get("reviseDate"))
-    free_text = "\n".join([str(id_abs or ""), str(id_purp or ""), " ".join(keywords)]).strip()
-
-    return {
-        "title": title,
-        "description_text": free_text or None,
-        "description_excerpt": str(id_purp or "").strip() or None,
-        "update_frequency": _parse_update_frequency(free_text),
-        "last_updated": revise_dt or create_dt,
-        "source": "portal",
-        "dataset_url": dataset_url,
-        "raw_record": record,
-    }
-
-
-def build_portal_metadata_from_url(dataset_url: str, workspace: str) -> Dict[str, Any]:
-    xml_dir = os.path.join(workspace, "xml")
-    raw_jsonl = os.path.join(workspace, "dataIdInfo_only.jsonl")
-    clean_jsonl_path = os.path.join(workspace, "dataIdInfo_only_clean.jsonl")
-    skip_list = os.path.join(workspace, "skipped_parse_error.txt")
-
-    download_result = fetch_metadata_xml_from_dataset_url(dataset_url, xml_dir)
-    convert_result = convert_xml_dir_to_jsonl(xml_dir, raw_jsonl, skip_list)
-    clean_result = clean_jsonl(raw_jsonl, clean_jsonl_path)
-    record = _read_clean_jsonl_record(clean_jsonl_path)
-    if not record:
-        raise ValueError("Metadata XML was downloaded, but no usable dataIdInfo record could be extracted.")
-
-    meta = portal_record_to_metadata(record, dataset_url)
-    meta["pipeline"] = {
-        "download": download_result,
-        "convert": convert_result,
-        "clean": clean_result,
-        "raw_jsonl": raw_jsonl,
-        "clean_jsonl": clean_jsonl_path,
-    }
-    return meta
-
-
-def score_metadata(
-    csv_path: str,
-    df: pd.DataFrame,
-    issues_list: List[Dict[str, str]],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, List[Dict[str, str]]]:
-    del csv_path
+# 与 v5 对齐
+def score_metadata(csv_path: str, df: pd.DataFrame, issues_list: List[Dict[str, str]], metadata: Optional[Dict[str, Any]] = None) -> Tuple[float, List[Dict[str, str]]]:
     score = 100.0
-    has_portal_desc = bool(metadata and metadata.get("source") == "portal" and metadata.get("description_text"))
-    if not has_portal_desc:
-        issues_list.append(issue("metadata", "Portal metadata description was not available.", "high"))
-        score -= 30
 
-    description_text = str(metadata.get("description_text")) if metadata and metadata.get("description_text") else None
+    sidecars = find_sidecar_metadata_files(csv_path)
+
+    portal_desc = None
+    if metadata:
+        portal_desc = (
+            metadata.get("description_text")
+            or metadata.get("text")
+            or metadata.get("description")
+            or metadata.get("dataIdInfo", {}).get("idAbs", {}).get("#text")
+        )
+
+    has_portal_desc = bool(portal_desc)
+
+    if sidecars:
+        issues_list.append(issue("metadata", f"Found sidecar metadata files: {[os.path.basename(x) for x in sidecars]}.", "low"))
+    else:
+        if not has_portal_desc:
+            issues_list.append(issue("metadata", "No sidecar metadata file (e.g., data dictionary/README) found.", "medium"))
+            score -= 30
+
+    description_text = None
+    if portal_desc:
+        description_text = str(portal_desc)
+    else:
+        for p in sidecars:
+            t = _read_text_sidecar(p)
+            if t:
+                description_text = t
+                break
+
     if description_text:
         desc = description_text.lower()
-        missing_desc = [col for col in df.columns if (str(col).lower() not in desc) and not is_vestigial(col)]
+
+        missing_desc = [c for c in df.columns if (str(c).lower() not in desc) and not is_vestigial(c)]
         if missing_desc:
             score -= min(40, 3 * len(missing_desc))
             issues_list.append(issue("metadata", f"{len(missing_desc)} fields not described in metadata/description.", "medium"))
+
         if len(desc.strip()) < 80:
             score -= 10
             issues_list.append(issue("metadata", "Metadata description is very short; may be insufficient.", "medium"))
     else:
         score -= 30
-        issues_list.append(issue("metadata", "No description text found in extracted portal metadata.", "high"))
+        issues_list.append(issue("metadata", "No description text found (portal description not available locally).", "high"))
 
-    unnamed = [col for col in df.columns if str(col).strip().lower().startswith("unnamed")]
+    unnamed = [c for c in df.columns if str(c).strip().lower().startswith("unnamed")]
     if unnamed:
         issues_list.append(issue("metadata", f"Unnamed columns detected: {unnamed[:4]}{'...' if len(unnamed) > 4 else ''}.", "high"))
         score -= 20
+
     return float(np.clip(score, 0, 100)), issues_list
 
 
+# =========================
+# Usage guidance
+# =========================
 def _bucket(score: float) -> str:
     if score >= 80:
         return "good"
@@ -621,17 +864,35 @@ def generate_usage_guidance(row: pd.Series) -> pd.Series:
     return pd.Series({"Recommended_Use": " | ".join(do), "Not_Recommended_For": " | ".join(avoid)})
 
 
-def run_assessment(uploaded_path: str, dataset_url: str) -> Dict[str, Any]:
-    workspace = tempfile.mkdtemp(prefix="ottawa_dqs_")
-    metadata = build_portal_metadata_from_url(dataset_url, workspace)
+# =========================
+# Runtime metadata matching
+# =========================
+def load_runtime_metadata_maps() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    portal_map = load_portal_metadata_jsonl(METADATA_JSONL_PATH)
+    catalog_map = load_catalog_metadata_json(METADATA_CATALOG_JSON_PATH)
+    return portal_map, catalog_map
+
+
+def build_metadata_for_uploaded_file(uploaded_path: str, portal_map: Dict[str, Dict[str, Any]], catalog_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    csv_name = Path(uploaded_path).name
+    matched_portal = match_portal_metadata(csv_name, portal_map)
+    matched_catalog = match_portal_metadata(csv_name, catalog_map)
+    sidecar_meta = infer_metadata_from_sidecars(find_sidecar_metadata_files(uploaded_path))
+    merged = merge_metadata_sources(sidecar_meta, matched_portal, matched_catalog)
+    merged["matched_filename"] = csv_name
+    return merged
+
+
+def run_assessment(uploaded_path: str, portal_map: Dict[str, Dict[str, Any]], catalog_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    metadata = build_metadata_for_uploaded_file(uploaded_path, portal_map, catalog_map)
     df = read_csv_flex(uploaded_path)
     issues_list: List[Dict[str, str]] = []
     df_clean, issues_list = clean_df(df, issues_list)
 
     usability, issues_list = score_usability(df_clean, issues_list)
     completeness, issues_list = score_completeness(df_clean, issues_list)
-    freshness, issues_list = score_freshness(df_clean, issues_list, metadata=metadata)
-    metadata_score, issues_list = score_metadata(uploaded_path, df_clean, issues_list, metadata=metadata)
+    freshness, issues_list = score_freshness(df_clean, issues_list, metadata=metadata or None)
+    metadata_score, issues_list = score_metadata(uploaded_path, df_clean, issues_list, metadata=metadata or None)
     accessibility, issues_list = score_accessibility(uploaded_path, df_clean, issues_list)
 
     scores = {
@@ -672,23 +933,20 @@ def run_assessment(uploaded_path: str, dataset_url: str) -> Dict[str, Any]:
         "score_df": score_df,
         "issues_df": issues_df,
         "total": total,
-        "workspace": workspace,
     }
 
 
+# =========================
+# Streamlit UI
+# =========================
 st.set_page_config(page_title="Open Ottawa DQS", layout="wide")
 st.title("Open Ottawa DQS")
-st.caption("Single-file assessment with runtime Open Ottawa metadata retrieval.")
+st.caption("Single-file assessment with local dual-metadata matching (JSONL + catalog JSON).")
 
-dataset_url = st.text_input(
-    "Open Ottawa dataset URL",
-    placeholder="https://open.ottawa.ca/datasets/...",
-    help="Required. Used to retrieve ArcGIS metadata.xml and derive portal metadata.",
-)
 uploaded = st.file_uploader("Upload a CSV or Excel export", type=["csv", "txt", "xlsx"])
 
-if not dataset_url or uploaded is None:
-    st.info("Provide the Open Ottawa dataset URL and upload one dataset file to run the assessment.")
+if uploaded is None:
+    st.info("Upload one dataset file to run the assessment.")
     st.stop()
 
 with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}") as tmp:
@@ -696,8 +954,9 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}") as tm
     upload_path = tmp.name
 
 try:
-    with st.spinner("Fetching portal metadata, extracting XML fields, cleaning metadata, and scoring dataset..."):
-        result = run_assessment(upload_path, dataset_url)
+    portal_map, catalog_map = load_runtime_metadata_maps()
+    with st.spinner("Matching local metadata sources and scoring dataset..."):
+        result = run_assessment(upload_path, portal_map, catalog_map)
 except Exception as exc:
     st.error(str(exc))
     st.stop()
@@ -716,20 +975,21 @@ with left:
     st.subheader("Preview")
     st.dataframe(result["df_raw"].head(20), use_container_width=True)
     st.divider()
-    st.subheader("Extracted Portal Metadata")
+    st.subheader("Matched Metadata")
     meta_view = {
         "title": metadata.get("title"),
         "update_frequency": metadata.get("update_frequency"),
-        "last_updated": metadata.get("last_updated").isoformat()
-        if isinstance(metadata.get("last_updated"), datetime)
-        else None,
-        "dataset_url": metadata.get("dataset_url"),
+        "last_updated": metadata.get("last_updated").isoformat() if isinstance(metadata.get("last_updated"), datetime) else None,
+        "source": metadata.get("source"),
+        "source_chain": metadata.get("source_chain"),
+        "landing_page": metadata.get("landing_page"),
+        "csv_url": metadata.get("csv_url"),
+        "matched_filename": metadata.get("matched_filename"),
     }
     st.json(meta_view)
-    if metadata.get("description_excerpt"):
+    if metadata.get("description_text"):
         st.markdown("**Description excerpt**")
-        st.write(str(metadata["description_excerpt"])[:1200])
-
+        st.write(str(metadata["description_text"])[:1200])
 
 with right:
     st.subheader("Quality Score")
